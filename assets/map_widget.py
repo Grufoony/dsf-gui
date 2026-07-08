@@ -19,8 +19,25 @@ Screen pixels (sx, sy)
 Geometry cache
 ──────────────
 Edge geometries are stored as lat/lon WKT in the DB.  We project them once
-into world-pixel coordinates per zoom level and cache the result.  On pan,
-converting to screen coords is just two subtractions—no trig.
+into world-pixel coordinates per zoom level and cache the result, along with
+a ready-to-draw QPolygonF, a bounding box (for viewport culling), and a
+spatial grid index (for O(1)-ish hit testing).  Because these are all in
+*world*-pixel space, panning never touches them: the QPainter is translated
+once per frame and the cached polygons are drawn as-is — no per-point
+Python-level coordinate math on every repaint.
+
+Performance notes
+──────────────────
+- Edge polygons are built once per zoom level (see _ensure_geo_cache) and
+  drawn via a single QPainter.translate(), instead of rebuilding a
+  QPolygonF from scratch (with a Python list comprehension) on every paint.
+- Edges whose bounding box doesn't intersect the viewport are skipped
+  entirely (viewport culling).
+- Placeholder tiles (scaled-up parent tiles shown while the real tile is
+  still loading) are cached per (zoom, tx, ty, filter) so the crop/scale/
+  filter work isn't repeated on every repaint during a pan.
+- Hit testing (hover + click) uses a coarse spatial grid so we only test
+  segments of edges near the cursor instead of every edge in the dataset.
 """
 
 from __future__ import annotations
@@ -142,6 +159,9 @@ class MapWidget(QWidget):
 
     edge_clicked = Signal(dict, int)
 
+    # Spatial-grid cell size (world pixels) used to bucket edges for hit testing.
+    _GRID_CELL = 512
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -159,11 +179,20 @@ class MapWidget(QWidget):
 
         # Geometry cache: [[(wx, wy), …], …] valid for self._geo_zoom
         self._geo_cache: list[list[tuple[float, float]]] = []
+        # Ready-to-draw polygons in world-pixel space, parallel to _geo_cache.
+        self._geo_polygons: list[QPolygonF] = []
+        # (minx, miny, maxx, maxy) per edge in world-pixel space, or None.
+        self._geo_bounds: list[Optional[tuple[float, float, float, float]]] = []
+        # Spatial grid for hit testing: {(gx, gy): [edge_index, ...]}
+        self._grid: dict[tuple[int, int], list[int]] = {}
         self._geo_zoom: Optional[int] = None
 
         # ── Tile cache ─────────────────────────────────────────────────────
         self._raw: dict[tuple, QPixmap] = {}  # {(z, tx, ty): raw pixmap}
         self._filt: dict[tuple, QPixmap] = {}  # {(z, tx, ty): filtered pixmap}
+        # {(z, tx, ty, filter): scaled placeholder pixmap} — avoids redoing
+        # the crop/scale/filter work on every repaint while a tile loads.
+        self._placeholder_cache: dict[tuple, QPixmap] = {}
         self._pending: set[tuple] = set()
         self.tile_filter: str = "invert"  # 'normal' | 'gray' | 'invert'
 
@@ -212,6 +241,7 @@ class MapWidget(QWidget):
     def set_tile_filter(self, mode: str):
         self.tile_filter = mode
         self._filt.clear()  # regenerated from raw on next paint
+        self._placeholder_cache.clear()
         self.update()
 
     def fit_bounds(
@@ -247,14 +277,54 @@ class MapWidget(QWidget):
         return sx + self._cx - self.width() * 0.5, sy + self._cy - self.height() * 0.5
 
     def _ensure_geo_cache(self):
-        """Project edge geometries to world pixels (no-op if zoom unchanged)."""
+        """
+        Project edge geometries to world pixels and build the draw-ready
+        QPolygonF list, bounding boxes, and spatial grid.  No-op if zoom
+        hasn't changed since the last build.
+        """
         if self._geo_zoom == self.zoom and self._geo_cache:
             return
-        self._geo_cache = [
-            [lat_lon_to_world(lat, lon, self.zoom) for lon, lat in edge["geometry"]]
-            for edge in self.edges
-        ]
+
+        cell = self._GRID_CELL
+        self._geo_cache = []
+        self._geo_polygons = []
+        self._geo_bounds = []
+        self._grid = {}
+
+        for idx, edge in enumerate(self.edges):
+            pts = [lat_lon_to_world(lat, lon, self.zoom) for lon, lat in edge["geometry"]]
+            self._geo_cache.append(pts)
+
+            if len(pts) >= 2:
+                self._geo_polygons.append(QPolygonF([QPointF(x, y) for x, y in pts]))
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                bounds = (min(xs), min(ys), max(xs), max(ys))
+                self._geo_bounds.append(bounds)
+
+                gx0, gy0 = int(bounds[0] // cell), int(bounds[1] // cell)
+                gx1, gy1 = int(bounds[2] // cell), int(bounds[3] // cell)
+                for gx in range(gx0, gx1 + 1):
+                    for gy in range(gy0, gy1 + 1):
+                        self._grid.setdefault((gx, gy), []).append(idx)
+            else:
+                self._geo_polygons.append(QPolygonF())
+                self._geo_bounds.append(None)
+
         self._geo_zoom = self.zoom
+
+    def _candidate_edges(self, wx: float, wy: float, thr: float) -> set[int]:
+        """Return indices of edges whose grid cells are near (wx, wy)."""
+        cell = self._GRID_CELL
+        gx0, gy0 = int((wx - thr) // cell), int((wy - thr) // cell)
+        gx1, gy1 = int((wx + thr) // cell), int((wy + thr) // cell)
+        candidates: set[int] = set()
+        for gx in range(gx0, gx1 + 1):
+            for gy in range(gy0, gy1 + 1):
+                bucket = self._grid.get((gx, gy))
+                if bucket:
+                    candidates.update(bucket)
+        return candidates
 
     def _visible_tile_range(self) -> tuple[int, int, int, int]:
         w, h = self.width(), self.height()
@@ -287,6 +357,11 @@ class MapWidget(QWidget):
         pm = QPixmap()
         if pm.loadFromData(data):
             self._raw[key] = pm
+            # This tile may now serve as a source for placeholders at other
+            # zoom levels (or be drawn directly itself); either way any
+            # cached placeholder crops that predate it are stale. Tile loads
+            # are infrequent relative to repaints, so this is cheap.
+            self._placeholder_cache.clear()
             self.update()
 
     def _filtered_tile(self, z: int, tx: int, ty: int) -> Optional[QPixmap]:
@@ -299,22 +374,31 @@ class MapWidget(QWidget):
         return self._filt[key]
 
     def _placeholder_tile(self, tx: int, ty: int) -> Optional[QPixmap]:
-        """Return a scaled parent tile while the real one loads."""
+        """Return a scaled parent tile while the real one loads (cached)."""
+        cache_key = (self.zoom, tx, ty, self.tile_filter)
+        cached = self._placeholder_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         for dz in range(1, 5):
             pz = self.zoom - dz
             if pz < 0:
                 break
             ptx, pty = tx >> dz, ty >> dz
-            key = (pz, ptx, pty)
-            if key in self._raw:
-                portion = 256 >> dz
-                ox = (tx % (1 << dz)) * portion
-                oy = (ty % (1 << dz)) * portion
-                src = _apply_filter(self._raw[key], self.tile_filter)
-                cropped = src.copy(ox, oy, portion, portion)
-                return cropped.scaled(
-                    256, 256, Qt.IgnoreAspectRatio, Qt.FastTransformation
-                )
+            # Reuse the already-cached filtered parent tile instead of
+            # re-running _apply_filter on every call.
+            src = self._filtered_tile(pz, ptx, pty)
+            if src is None:
+                continue
+            portion = 256 >> dz
+            ox = (tx % (1 << dz)) * portion
+            oy = (ty % (1 << dz)) * portion
+            cropped = src.copy(ox, oy, portion, portion)
+            result = cropped.scaled(
+                256, 256, Qt.IgnoreAspectRatio, Qt.FastTransformation
+            )
+            self._placeholder_cache[cache_key] = result
+            return result
         return None
 
     # ── Painting ──────────────────────────────────────────────────────────────
@@ -353,15 +437,29 @@ class MapWidget(QWidget):
         cx, cy = self._cx, self._cy
         hw, hh = self.width() * 0.5, self.height() * 0.5
 
+        # Visible world-pixel rect, for cheap bounding-box culling.
+        vx0, vy0 = cx - hw, cy - hh
+        vx1, vy1 = cx + hw, cy + hh
+
         pen = QPen()
         pen.setCapStyle(Qt.RoundCap)
         pen.setJoinStyle(Qt.RoundJoin)
 
         hi_id = self.highlighted_edge_id
 
-        for i, (edge, pts) in enumerate(zip(self.edges, self._geo_cache)):
-            if len(pts) < 2:
+        # Draw everything in world-pixel space; a single translate maps it
+        # onto the screen, so cached polygons need no per-point rebuilding.
+        p.save()
+        p.translate(-cx + hw, -cy + hh)
+
+        for i, (edge, poly, bounds) in enumerate(
+            zip(self.edges, self._geo_polygons, self._geo_bounds)
+        ):
+            if bounds is None:
                 continue
+            bminx, bminy, bmaxx, bmaxy = bounds
+            if bmaxx < vx0 or bminx > vx1 or bmaxy < vy0 or bminy > vy1:
+                continue  # outside viewport — skip entirely
             if hi_id and edge["id"] == hi_id:
                 continue  # drawn last, on top
 
@@ -377,8 +475,6 @@ class MapWidget(QWidget):
             pen.setColor(color)
             pen.setWidthF(width)
             p.setPen(pen)
-
-            poly = QPolygonF([QPointF(wx - cx + hw, wy - cy + hh) for wx, wy in pts])
             p.drawPolyline(poly)
 
             # Autostrada dashed overlay
@@ -396,8 +492,8 @@ class MapWidget(QWidget):
             for i, edge in enumerate(self.edges):
                 if edge["id"] != hi_id:
                     continue
-                pts = self._geo_cache[i]
-                if len(pts) < 2:
+                poly = self._geo_polygons[i]
+                if poly.isEmpty():
                     break
                 density = (
                     self.edge_densities[i] if i < len(self.edge_densities) else 0.0
@@ -407,11 +503,10 @@ class MapWidget(QWidget):
                 pen.setColor(QColor(255, 255, 255, 230))
                 pen.setWidthF(width)
                 p.setPen(pen)
-                poly = QPolygonF(
-                    [QPointF(wx - cx + hw, wy - cy + hh) for wx, wy in pts]
-                )
                 p.drawPolyline(poly)
                 break
+
+        p.restore()
 
     def _draw_node_highlight(self, p: QPainter):
         lon, lat = self.highlighted_node  # type: ignore[misc]
@@ -470,6 +565,7 @@ class MapWidget(QWidget):
 
         self._geo_zoom = None
         self._filt.clear()
+        self._placeholder_cache.clear()
         self.update()
         self._request_tiles()
 
@@ -493,34 +589,31 @@ class MapWidget(QWidget):
         return math.hypot(px - ax - t * dx, py - ay - t * dy)
 
     def _is_near_edge(self, sx: float, sy: float, thr: float = 8.0) -> bool:
-        if not self._geo_cache:
+        if not self.edges:
             return False
-        cx, cy = self._cx, self._cy
-        hw, hh = self.width() * 0.5, self.height() * 0.5
-        for pts in self._geo_cache:
-            for i in range(len(pts) - 1):
-                ax = pts[i][0] - cx + hw
-                ay = pts[i][1] - cy + hh
-                bx = pts[i + 1][0] - cx + hw
-                by = pts[i + 1][1] - cy + hh
-                if self._seg_dist(sx, sy, ax, ay, bx, by) < thr:
+        self._ensure_geo_cache()
+        wx, wy = self._s2w(sx, sy)
+        for i in self._candidate_edges(wx, wy, thr):
+            pts = self._geo_cache[i]
+            for j in range(len(pts) - 1):
+                ax, ay = pts[j]
+                bx, by = pts[j + 1]
+                if self._seg_dist(wx, wy, ax, ay, bx, by) < thr:
                     return True
         return False
 
     def _handle_click(self, sx: float, sy: float, thr: float = 10.0):
-        if not self._geo_cache:
+        if not self.edges:
             return
         self._ensure_geo_cache()
-        cx, cy = self._cx, self._cy
-        hw, hh = self.width() * 0.5, self.height() * 0.5
+        wx, wy = self._s2w(sx, sy)
         best_d, best_i = float("inf"), -1
-        for i, pts in enumerate(self._geo_cache):
+        for i in self._candidate_edges(wx, wy, thr):
+            pts = self._geo_cache[i]
             for j in range(len(pts) - 1):
-                ax = pts[j][0] - cx + hw
-                ay = pts[j][1] - cy + hh
-                bx = pts[j + 1][0] - cx + hw
-                by = pts[j + 1][1] - cy + hh
-                d = self._seg_dist(sx, sy, ax, ay, bx, by)
+                ax, ay = pts[j]
+                bx, by = pts[j + 1]
+                d = self._seg_dist(wx, wy, ax, ay, bx, by)
                 if d < best_d:
                     best_d, best_i = d, i
         if best_i >= 0 and best_d < thr:
