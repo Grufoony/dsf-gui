@@ -43,22 +43,20 @@ Performance notes
 from __future__ import annotations
 
 import math
-from typing import Optional
-import requests
 
+import requests
 from PySide6.QtCore import (
-    Qt,
     QObject,
     QPoint,
     QPointF,
     QRunnable,
+    Qt,
     QThreadPool,
     Signal,
     Slot,
 )
 from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QWidget
-
 
 # ── Coordinate helpers ────────────────────────────────────────────────────────
 
@@ -175,17 +173,17 @@ class MapWidget(QWidget):
         self.edge_colors: list[QColor] = []
         self.edge_densities: list[float] = []
         self.highlighted_edge_id = None
-        self.highlighted_node: Optional[tuple[float, float]] = None  # (lon, lat)
+        self.highlighted_node: tuple[float, float] | None = None  # (lon, lat)
 
         # Geometry cache: [[(wx, wy), …], …] valid for self._geo_zoom
         self._geo_cache: list[list[tuple[float, float]]] = []
         # Ready-to-draw polygons in world-pixel space, parallel to _geo_cache.
         self._geo_polygons: list[QPolygonF] = []
         # (minx, miny, maxx, maxy) per edge in world-pixel space, or None.
-        self._geo_bounds: list[Optional[tuple[float, float, float, float]]] = []
+        self._geo_bounds: list[tuple[float, float, float, float] | None] = []
         # Spatial grid for hit testing: {(gx, gy): [edge_index, ...]}
         self._grid: dict[tuple[int, int], list[int]] = {}
-        self._geo_zoom: Optional[int] = None
+        self._geo_zoom: int | None = None
 
         # ── Tile cache ─────────────────────────────────────────────────────
         self._raw: dict[tuple, QPixmap] = {}  # {(z, tx, ty): raw pixmap}
@@ -203,7 +201,7 @@ class MapWidget(QWidget):
         self._pool.setMaxThreadCount(8)
 
         # ── Drag state ─────────────────────────────────────────────────────
-        self._drag_start: Optional[QPoint] = None
+        self._drag_start: QPoint | None = None
         self._drag_cx: float = 0.0
         self._drag_cy: float = 0.0
 
@@ -213,7 +211,7 @@ class MapWidget(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_center(self, lat: float, lon: float, zoom: Optional[int] = None):
+    def set_center(self, lat: float, lon: float, zoom: int | None = None):
         """Pan (and optionally zoom) to the given coordinate."""
         if zoom is not None:
             self.zoom = max(0, min(19, zoom))
@@ -292,7 +290,9 @@ class MapWidget(QWidget):
         self._grid = {}
 
         for idx, edge in enumerate(self.edges):
-            pts = [lat_lon_to_world(lat, lon, self.zoom) for lon, lat in edge["geometry"]]
+            pts = [
+                lat_lon_to_world(lat, lon, self.zoom) for lon, lat in edge["geometry"]
+            ]
             self._geo_cache.append(pts)
 
             if len(pts) >= 2:
@@ -364,7 +364,7 @@ class MapWidget(QWidget):
             self._placeholder_cache.clear()
             self.update()
 
-    def _filtered_tile(self, z: int, tx: int, ty: int) -> Optional[QPixmap]:
+    def _filtered_tile(self, z: int, tx: int, ty: int) -> QPixmap | None:
         key = (z, tx, ty)
         raw = self._raw.get(key)
         if raw is None:
@@ -373,7 +373,7 @@ class MapWidget(QWidget):
             self._filt[key] = _apply_filter(raw, self.tile_filter)
         return self._filt[key]
 
-    def _placeholder_tile(self, tx: int, ty: int) -> Optional[QPixmap]:
+    def _placeholder_tile(self, tx: int, ty: int) -> QPixmap | None:
         """Return a scaled parent tile while the real one loads (cached)."""
         cache_key = (self.zoom, tx, ty, self.tile_filter)
         cached = self._placeholder_cache.get(cache_key)
