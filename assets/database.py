@@ -1,19 +1,29 @@
 """
 database.py
 ───────────
-All SQLite querying and data-transformation logic, plus the colour
-precomputation that replaces the D3 colour-scale calls in the JS original.
+All SQLite querying and data-transformation logic, plus colour computation
+that replaces the D3 colour-scale calls in the JS original.
+
+Memory strategy
+----------------
+Time-series observables (density, speed, traveltime, n_observations,
+queue_length) are stored as 2-D numpy float32 arrays shaped
+(n_timesteps, n_edges) instead of nested Python lists of dicts/floats.
+
+`edge_colors_for_timestep()` builds just the ~n_edges QColors needed for
+the frame currently on screen, in O(n_edges) using vectorised numpy math.
+That list is thrown away (garbage collected) the moment the next frame is
+shown, so peak colour memory is O(edges), not O(edges * timesteps).
 """
 
 from __future__ import annotations
 
 import datetime
-import math
 import sqlite3
 from typing import Any
 
+import numpy as np
 from PySide6.QtGui import QColor
-
 
 # ── Observable metadata ───────────────────────────────────────────────────────
 
@@ -38,6 +48,9 @@ def value_to_qcolor(
     Map *value* in [dmin, dmax] to a QColor on the green→yellow→red scale.
     Pass reversed_=True for red→yellow→green (used for speed).
     alpha=176 ≈ 0.69 x 255, matching the JS rgba(…, 0.69).
+
+    Kept for single-value use (e.g. tooltips); bulk colouring should use
+    edge_colors_for_timestep() instead, which is vectorised.
     """
     rng = dmax - dmin
     t = 0.0 if rng == 0 else (value - dmin) / rng
@@ -57,34 +70,60 @@ def value_to_qcolor(
     return QColor(r, g, 0, alpha)
 
 
-def precompute_all_colors(
-    obs_data: dict[str, list[dict]],
-    obs_domains: dict[str, tuple[float, float]],
-) -> dict[str, list[list[QColor]]]:
-    """
-    Build a complete colour lookup table so that slider updates are O(1).
+def _row_to_colors(
+    values: np.ndarray,
+    dmin: float,
+    dmax: float,
+    reversed_: bool = False,
+    alpha: int = 176,
+) -> list[QColor]:
+    """Vectorised version of value_to_qcolor for a whole 1-D array of values."""
+    rng = dmax - dmin
+    if rng == 0:
+        t = np.zeros_like(values, dtype=np.float32)
+    else:
+        t = (values.astype(np.float32) - dmin) / rng
+    t = np.clip(t, 0.0, 1.0)
+    if reversed_:
+        t = 1.0 - t
 
-    Returns
-    -------
-    {observable_key: [[QColor per edge] per timestep]}
+    r = np.empty_like(t)
+    g = np.empty_like(t)
+    lo = t <= 0.5
+    hi = ~lo
+
+    s1 = t[lo] * 2
+    r[lo] = s1 * 255
+    g[lo] = 128 + s1 * 127
+
+    s2 = (t[hi] - 0.5) * 2
+    r[hi] = 255
+    g[hi] = (1.0 - s2) * 255
+
+    r_list = r.astype(np.uint8).tolist()
+    g_list = g.astype(np.uint8).tolist()
+    return [QColor(ri, gi, 0, alpha) for ri, gi in zip(r_list, g_list)]
+
+
+def edge_colors_for_timestep(
+    key: str,
+    idx: int,
+    values: dict[str, np.ndarray],
+    domains: dict[str, tuple[float, float]],
+    alpha: int = 176,
+) -> list[QColor]:
     """
-    result: dict[str, list[list[QColor]]] = {}
-    for key, rows in obs_data.items():
-        dmin, dmax = obs_domains.get(key, (0.0, 1.0))
-        rev = EDGE_OBSERVABLE_CONFIG.get(key, {}).get("reverseColorScale", False)
-        result[key] = [
-            [
-                value_to_qcolor(
-                    v if (v is not None and not math.isnan(float(v))) else 0.0,
-                    dmin,
-                    dmax,
-                    rev,
-                )
-                for v in row["values"]
-            ]
-            for row in rows
-        ]
-    return result
+    Build the QColor list for ONE timestep of ONE observable, on demand.
+    Call this from the UI whenever the slider moves / the observable
+    changes - it's cheap (O(n_edges)) and replaces precompute_all_colors().
+    """
+    arr = values.get(key)
+    if arr is None or idx >= len(arr):
+        return []
+    dmin, dmax = domains.get(key, (0.0, 1.0))
+    rev = EDGE_OBSERVABLE_CONFIG.get(key, {}).get("reverseColorScale", False)
+    row = np.nan_to_num(arr[idx], nan=0.0)
+    return _row_to_colors(row, dmin, dmax, rev, alpha)
 
 
 # ── Geometry parsing ──────────────────────────────────────────────────────────
@@ -148,7 +187,6 @@ def _travel_time_expr(conn: sqlite3.Connection) -> str:
         return "r.travel_time"
     if "travel_time_s" in cols:
         return "r.travel_time_s"
-    # Fallback: derive from length and speed
     return (
         "CASE WHEN r.avg_speed_kph > 0 "
         "THEN e.length / (r.avg_speed_kph / 3.6) ELSE 0 END"
@@ -166,18 +204,21 @@ def load_road_data(
     Returns
     -------
     {
-        "densities":   [{"datetime": dt, "densities": [float, …]}, …],
-        "observables": {
-            "density":      [{"datetime": dt, "values": [float, …]}, …],
-            "speed":        …,
-            "n_observations": …,
-            "traveltime":   …,
-            "queue_length": …,
+        "datetimes": [dt, …],                       # length T
+        "values": {                                  # each array shaped (T, n_edges), float32
+            "density":        np.ndarray,
+            "speed":          np.ndarray,
+            "traveltime":     np.ndarray,
+            "n_observations": np.ndarray,
+            "queue_length":   np.ndarray,
         },
         "domains": {"density": (min, max), "speed": …, …},
     }
+
     """
     edge_ids = [e["id"] for e in edges]
+    id_to_idx = {eid: i for i, eid in enumerate(edge_ids)}
+    n_edges = len(edge_ids)
     tt_expr = _travel_time_expr(conn)
 
     cur = conn.execute(
@@ -197,75 +238,76 @@ def load_road_data(
         (sim_id,),
     )
 
-    # Accumulate rows grouped by timestamp
-    density_rows: list[dict] = []
-    speed_rows: list[dict] = []
-    traveltime_rows: list[dict] = []
-    n_observations_rows: list[dict] = []
-    queuelength_rows: list[dict] = []
+    datetimes: list[datetime.datetime] = []
+    density_frames: list[np.ndarray] = []
+    speed_frames: list[np.ndarray] = []
+    tt_frames: list[np.ndarray] = []
+    nobs_frames: list[np.ndarray] = []
+    queue_frames: list[np.ndarray] = []
 
     cur_ts: Any = None
-    dm: dict = {}
-    sm: dict = {}
-    tm: dict = {}
-    nm: dict = {}
-    qm: dict = {}
+    dm = np.zeros(n_edges, dtype=np.float32)
+    sm = np.zeros(n_edges, dtype=np.float32)
+    tm = np.zeros(n_edges, dtype=np.float32)
+    nm = np.zeros(n_edges, dtype=np.float32)
+    qm = np.zeros(n_edges, dtype=np.float32)
+
     def _flush(ts_str: str):
-        dt = _parse_dt(ts_str)
-        dn = [float(dm.get(eid) or 0) for eid in edge_ids]
-        sn = [float(sm.get(eid) or 0) for eid in edge_ids]
-        tn = [float(tm.get(eid) or 0) for eid in edge_ids]
-        qn = [float(qm.get(eid) or 0) for eid in edge_ids]
-        density_rows.append({"datetime": dt, "densities": dn})
-        speed_rows.append({"datetime": dt, "values": sn})
-        traveltime_rows.append({"datetime": dt, "values": tn})
-        n_observations_rows.append({"datetime": dt, "values": [float(nm.get(eid) or 0) for eid in edge_ids]})
-        queuelength_rows.append({"datetime": dt, "values": qn})
+        datetimes.append(_parse_dt(ts_str))
+        # .copy() so the next frame's in-place writes don't corrupt this one
+        density_frames.append(dm.copy())
+        speed_frames.append(sm.copy())
+        tt_frames.append(tm.copy())
+        nobs_frames.append(nm.copy())
+        queue_frames.append(qm.copy())
 
     for ts, sid, d, s, t, n, q in cur:
         if ts != cur_ts:
             if cur_ts is not None:
                 _flush(cur_ts)
             cur_ts = ts
-            dm = {}
-            sm = {}
-            tm = {}
-            nm = {}
-            qm = {}
-        dm[sid] = d
-        sm[sid] = s
-        tm[sid] = t
-        nm[sid] = n
-        qm[sid] = q
+            dm.fill(0)
+            sm.fill(0)
+            tm.fill(0)
+            nm.fill(0)
+            qm.fill(0)
+        i = id_to_idx.get(sid)
+        if i is None:
+            continue  # road_data row references an edge we don't have
+        dm[i] = d or 0
+        sm[i] = s or 0
+        tm[i] = t or 0
+        nm[i] = n or 0
+        qm[i] = q or 0
 
     if cur_ts is not None:
         _flush(cur_ts)
 
-    obs: dict[str, list[dict]] = {
-        "density": [
-            {"datetime": r["datetime"], "values": r["densities"]} for r in density_rows
-        ],
-        "speed": speed_rows,
-        "traveltime": traveltime_rows,
-        "queue_length": queuelength_rows,
-        "n_observations": n_observations_rows,
+    def _stack(frames: list[np.ndarray]) -> np.ndarray:
+        if not frames:
+            return np.zeros((0, n_edges), dtype=np.float32)
+        return np.stack(frames)
+
+    values: dict[str, np.ndarray] = {
+        "density": _stack(density_frames),
+        "speed": _stack(speed_frames),
+        "traveltime": _stack(tt_frames),
+        "n_observations": _stack(nobs_frames),
+        "queue_length": _stack(queue_frames),
     }
 
-    def _domain(rows: list[dict]) -> tuple[float, float]:
-        vals = [
-            v
-            for r in rows
-            for v in r["values"]
-            if v is not None and math.isfinite(float(v))
-        ]
-        if not vals:
+    def _domain(arr: np.ndarray) -> tuple[float, float]:
+        if arr.size == 0:
             return (0.0, 1.0)
-        mn, mx = min(vals), max(vals)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return (0.0, 1.0)
+        mn, mx = float(finite.min()), float(finite.max())
         return (mn, mn + 1.0) if mn == mx else (mn, mx)
 
-    domains = {k: _domain(v) for k, v in obs.items()}
+    domains = {k: _domain(v) for k, v in values.items()}
 
-    return {"densities": density_rows, "observables": obs, "domains": domains}
+    return {"datetimes": datetimes, "values": values, "domains": domains}
 
 
 def load_global_data(
@@ -312,8 +354,6 @@ def load_global_data(
                 rows.append(entry)
             return rows
 
-    # Fallback: compute averages on-the-fly
-    # (counts column may not exist; use a safe expression)
     road_cols = {row[1] for row in conn.execute("PRAGMA table_info(road_data)")}
     count_expr = "SUM(counts)" if "counts" in road_cols else "COUNT(*)"
     cur = conn.execute(

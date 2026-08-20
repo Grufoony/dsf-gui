@@ -14,14 +14,13 @@ QMainWindow that wires everything together:
   │                                                    │───────│
   │                                                    │Chart  │
   ├────────────────────────────────────────────────────┴───────┤
-  │  ▶  FPS [10]  |══════════════slider══════════════|  label  │  
+  │  ▶  FPS [10]  |══════════════slider══════════════|  label  │
   └────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
 
 import sqlite3
-from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QPainter
@@ -46,16 +45,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .map_widget import MapWidget
 from .database import (
     EDGE_OBSERVABLE_CONFIG,
     MAX_DENSITY,
+    edge_colors_for_timestep,
     get_simulations,
     load_edges,
-    load_road_data,
     load_global_data,
-    precompute_all_colors,
+    load_road_data,
 )
+from .map_widget import MapWidget
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -261,7 +260,7 @@ class ChartWidget(QWidget):
             )
         self._canvas.draw_idle()
 
-    def _chart_x_to_index(self, event) -> Optional[int]:
+    def _chart_x_to_index(self, event) -> int | None:
         if event.inaxes != self._ax or event.xdata is None:
             return None
         n = len(self._global_data)
@@ -320,15 +319,14 @@ class MainWindow(QMainWindow):
 
         # ── App state ──────────────────────────────────────────────────────
         self._edges: list[dict] = []
-        self._densities: list[dict] = []  # [{datetime, densities:[]}]
-        self._obs_data: dict[str, list[dict]] = {}
+        self._datetimes: list = []  # one datetime per timestep
+        self._values: dict[str, np.ndarray] = {}  # key -> (T, n_edges) float32 array
         self._obs_domains: dict[str, tuple] = {}
         self._global_data: list[dict] = []
-        self._precomputed: dict[str, list[list[QColor]]] = {}
         self._current_idx: int = 0
         self._selected_obs: str = "density"
         self._is_playing: bool = False
-        self._highlighted_edge: Optional[dict] = None
+        self._highlighted_edge: dict | None = None
 
         # Playback timer
         self._timer = QTimer(self)
@@ -589,7 +587,7 @@ class MainWindow(QMainWindow):
         finally:
             conn.close()
 
-        if not bundle["densities"]:
+        if not bundle["datetimes"]:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(
                 self, "Error", f"No road_data found for simulation ID {sim_id}."
@@ -601,15 +599,12 @@ class MainWindow(QMainWindow):
 
     def _initialize_app(self, edges: list[dict], bundle: dict, global_data: list[dict]):
         self._edges = edges
-        self._densities = bundle["densities"]
-        self._obs_data = bundle["observables"]
+        self._datetimes = bundle["datetimes"]
+        self._values = bundle["values"]
         self._obs_domains = bundle["domains"]
         self._global_data = global_data
         self._current_idx = 0
         self._highlighted_edge = None
-
-        # Precompute colour table (once; ~50–200 ms for typical datasets)
-        self._precomputed = precompute_all_colors(self._obs_data, self._obs_domains)
 
         # Push edges to map
         self._map.set_edges(edges)
@@ -628,7 +623,7 @@ class MainWindow(QMainWindow):
             )
 
         # Slider
-        n = len(self._densities)
+        n = len(self._datetimes)
         self._slider.setMaximum(n - 1)
         self._slider.setValue(0)
 
@@ -646,18 +641,26 @@ class MainWindow(QMainWindow):
     # ── Visualization update ──────────────────────────────────────────────────
 
     def _apply_timestep(self, idx: int):
-        """Push the pre-computed colour array and densities for timestep *idx*."""
+        """Compute colours + densities for timestep *idx* on demand (O(n_edges))."""
         self._current_idx = idx
 
         key = self._selected_obs
-        colors = self._precomputed.get(key, [[]])[idx] if self._precomputed else []
-        dens = self._densities[idx]["densities"] if self._densities else []
+        colors = (
+            edge_colors_for_timestep(key, idx, self._values, self._obs_domains)
+            if self._values
+            else []
+        )
+        dens = (
+            self._values["density"][idx].tolist()
+            if self._values and idx < len(self._values.get("density", []))
+            else []
+        )
 
         self._map.set_edge_colors(colors)
         self._map.set_edge_densities(dens)
 
         # Update time label
-        dt = self._densities[idx]["datetime"]
+        dt = self._datetimes[idx]
         self._time_label.setText(dt.strftime("%Y-%m-%d %H:%M"))
 
         # Update chart marker
@@ -677,7 +680,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_slider_changed(self, value: int):
-        if self._densities:
+        if self._datetimes:
             self._apply_timestep(value)
 
     @Slot(int)
@@ -696,7 +699,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _playback_tick(self):
-        n = len(self._densities)
+        n = len(self._datetimes)
         if n == 0:
             return
         next_idx = (self._current_idx + 1) % n
@@ -720,7 +723,7 @@ class MainWindow(QMainWindow):
         if key and key != self._selected_obs:
             self._selected_obs = key
             self._refresh_legend()
-            if self._densities:
+            if self._datetimes:
                 self._apply_timestep(self._current_idx)
 
     def _take_screenshot(self):
@@ -839,11 +842,11 @@ class MainWindow(QMainWindow):
 
     def _show_edge_info(self, edge: dict, ts_idx: int):
         density = "N/A"
-        if self._densities and ts_idx < len(self._densities):
-            dens_list = self._densities[ts_idx]["densities"]
+        dens_arr = self._values.get("density") if self._values else None
+        if dens_arr is not None and ts_idx < len(dens_arr):
             try:
                 edge_pos = self._edges.index(edge)
-                d = dens_list[edge_pos]
+                d = dens_arr[ts_idx][edge_pos]
                 density = f"{d:.2f}"
             except ValueError, IndexError:
                 pass
