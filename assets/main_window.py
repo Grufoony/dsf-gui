@@ -519,7 +519,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("FPS:"))
         self._fps_spin = QDoubleSpinBox()
         self._fps_spin.setRange(1.0, 60.0)
-        self._fps_spin.setValue(10.0)
+        self._fps_spin.setValue(2.0)
         self._fps_spin.setDecimals(1)
         self._fps_spin.setFixedWidth(58)
         self._fps_spin.valueChanged.connect(self._on_fps_changed)
