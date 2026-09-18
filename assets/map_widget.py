@@ -129,6 +129,7 @@ class _TileJob(QRunnable):
     def run(self):
         sd = ("a", "b", "c")[(self._tx + self._ty) % 3]
         url = f"https://{sd}.tile.openstreetmap.org/{self._z}/{self._tx}/{self._ty}.png"
+        payload = b""
         try:
             r = requests.get(
                 url,
@@ -136,9 +137,20 @@ class _TileJob(QRunnable):
                 timeout=15,
             )
             if r.status_code == 200 and r.content:
-                # Emit raw bytes — QPixmap is created in the main thread below.
-                self._sig.ready.emit(self._z, self._tx, self._ty, r.content)
+                payload = r.content
         except Exception:
+            pass
+        try:
+            # Emit raw bytes — QPixmap is created in the main thread below.
+            # Failures are reported too, as an empty payload: _on_tile_ready
+            # clears the key from _pending before it tries to decode, which is
+            # what makes a failed tile retryable. Without this it stays pending
+            # for the life of the process, is never re-requested, and blocks
+            # anything waiting for the tile queue to drain.
+            self._sig.ready.emit(self._z, self._tx, self._ty, payload)
+        except RuntimeError:
+            # The map widget was destroyed while this job sat in the queue,
+            # i.e. the app is shutting down. Nothing left to deliver to.
             pass
 
 
@@ -242,6 +254,14 @@ class MapWidget(QWidget):
         self._filt.clear()  # regenerated from raw on next paint
         self._placeholder_cache.clear()
         self.update()
+
+    def pending_tile_count(self) -> int:
+        """Tiles still in flight for the current viewport."""
+        return len(self._pending)
+
+    def request_visible_tiles(self) -> None:
+        """Fetch any visible tile that is not cached yet (used before recording)."""
+        self._request_tiles()
 
     def fit_bounds(
         self,

@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,9 +40,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSlider,
     QSplitter,
+    QStyle,
+    QStyleOptionSlider,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -60,6 +64,7 @@ from .database import (
     ramp_color,
 )
 from .map_widget import MapWidget
+from .video_export import FFmpegSink, VideoRecorder, ffmpeg_path
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -141,6 +146,63 @@ class LegendWidget(QWidget):
         p.drawText(2, 54, min_s)
         p.drawText(mid_x, 54, mid_s)
         p.drawText(max_x, 54, max_s)
+        p.end()
+
+
+# ── Timeline slider ───────────────────────────────────────────────────────────
+
+
+class RangeSlider(QSlider):
+    """
+    The playback slider, with the chosen recording window shaded on its groove.
+
+    Marking in/out points is invisible otherwise: the numbers live in a label
+    off to the side, while the thing the user is actually pointing at is the
+    timeline.
+    """
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._range: tuple[int, int] | None = None
+
+    def set_marked_range(self, lo: int | None, hi: int | None):
+        self._range = None if lo is None or hi is None else (lo, hi)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._range is None or self.maximum() <= self.minimum():
+            return
+        lo, hi = self._range
+
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        groove = style.subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self
+        )
+        handle = style.subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self
+        )
+        # Positions are measured along the span the handle's centre can travel,
+        # which is the groove inset by half a handle at each end.
+        span = groove.width() - handle.width()
+        if span <= 0:
+            return
+        origin = groove.x() + handle.width() / 2
+
+        def pos(value: int) -> float:
+            t = (value - self.minimum()) / (self.maximum() - self.minimum())
+            return origin + t * span
+
+        x0, x1 = pos(lo), pos(hi)
+        band = QRectF(x0, groove.y(), max(2.0, x1 - x0), groove.height())
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(band, QColor(60, 140, 220, 110))
+        p.setPen(QColor(60, 140, 220, 220))
+        for x in (x0, x1):
+            p.drawLine(QPointF(x, groove.y() - 2), QPointF(x, groove.bottom() + 2))
         p.end()
 
 
@@ -332,6 +394,17 @@ class MainWindow(QMainWindow):
         self._selected_obs: str = DEFAULT_OBSERVABLE
         self._is_playing: bool = False
         self._highlighted_edge: dict | None = None
+
+        # ── Recording state ────────────────────────────────────────────────
+        self._db_path: Path | None = None  # for the default video filename
+        # Chosen window; None means "whichever end of the timeline".
+        self._in_idx: int | None = None
+        self._out_idx: int | None = None
+        # The recorder is held here for its whole run: dropping the last
+        # reference would let it be collected and its timer would stop.
+        self._recorder: VideoRecorder | None = None
+        self._record_progress: QProgressDialog | None = None
+        self._record_saved_state: tuple[bool, int] | None = None
 
         # Playback timer
         self._timer = QTimer(self)
@@ -527,13 +600,34 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(6)
 
+        # Recording window: mark in / out around the current frame
+        self._in_btn = QPushButton("⟦")
+        self._in_btn.setFixedSize(26, 26)
+        self._in_btn.setToolTip("Start the recording at the current frame")
+        self._in_btn.clicked.connect(self._set_range_in)
+        layout.addWidget(self._in_btn)
+
         # Slider
-        self._slider = QSlider(Qt.Horizontal)
+        self._slider = RangeSlider(Qt.Horizontal)
         self._slider.setMinimum(0)
         self._slider.setMaximum(0)
         self._slider.setSingleStep(1)
         self._slider.valueChanged.connect(self._on_slider_changed)
         layout.addWidget(self._slider, stretch=1)
+
+        self._out_btn = QPushButton("⟧")
+        self._out_btn.setFixedSize(26, 26)
+        self._out_btn.setToolTip("End the recording at the current frame")
+        self._out_btn.clicked.connect(self._set_range_out)
+        layout.addWidget(self._out_btn)
+
+        self._clear_range_btn = QPushButton("✕")
+        self._clear_range_btn.setFixedSize(26, 26)
+        self._clear_range_btn.setToolTip(
+            "Clear the recording window (record everything)"
+        )
+        self._clear_range_btn.clicked.connect(self._clear_range)
+        layout.addWidget(self._clear_range_btn)
 
         layout.addSpacing(6)
 
@@ -543,6 +637,19 @@ class MainWindow(QMainWindow):
         self._time_label.setAlignment(Qt.AlignCenter)
         self._time_label.setStyleSheet("font-size: 11px; font-weight: bold;")
         layout.addWidget(self._time_label)
+
+        # Chosen window, then the button that records it
+        self._range_label = QLabel("—")
+        self._range_label.setMinimumWidth(190)
+        self._range_label.setAlignment(Qt.AlignCenter)
+        self._range_label.setStyleSheet("font-size: 10px; color: #555;")
+        layout.addWidget(self._range_label)
+
+        self._record_btn = QPushButton("⏺  Record")
+        self._record_btn.setFixedHeight(28)
+        self._record_btn.setToolTip("Record the selected time window to an MP4 video")
+        self._record_btn.clicked.connect(self._record_video)
+        layout.addWidget(self._record_btn)
 
     # ── Database loading ──────────────────────────────────────────────────────
 
@@ -555,6 +662,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._db_path = Path(path)
 
         # Open and validate
         try:
@@ -655,6 +763,11 @@ class MainWindow(QMainWindow):
         self._slider.setMaximum(n - 1)
         self._slider.setValue(0)
 
+        # Recording window — a range from the previous database means nothing here
+        self._in_idx = None
+        self._out_idx = None
+        self._update_range_ui()
+
         # Chart
         self._chart.set_global_data(global_data)
 
@@ -743,6 +856,56 @@ class MainWindow(QMainWindow):
     def _on_fps_changed(self, fps: float):
         if self._is_playing:
             self._timer.setInterval(max(1, int(1000 / fps)))
+        self._update_range_ui()  # the label quotes the resulting video duration
+
+    # ── Recording window ──────────────────────────────────────────────────────
+
+    def _record_range(self) -> tuple[int, int]:
+        """The window to record, as inclusive timestep indices."""
+        last = max(0, len(self._datetimes) - 1)
+        lo = 0 if self._in_idx is None else min(self._in_idx, last)
+        hi = last if self._out_idx is None else min(self._out_idx, last)
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    @Slot()
+    def _set_range_in(self):
+        if not self._datetimes:
+            return
+        self._in_idx = self._current_idx
+        # Dragging the start past the end takes the end with it, rather than
+        # refusing the click and leaving the user to guess why.
+        if self._out_idx is not None and self._out_idx < self._in_idx:
+            self._out_idx = self._in_idx
+        self._update_range_ui()
+
+    @Slot()
+    def _set_range_out(self):
+        if not self._datetimes:
+            return
+        self._out_idx = self._current_idx
+        if self._in_idx is not None and self._in_idx > self._out_idx:
+            self._in_idx = self._out_idx
+        self._update_range_ui()
+
+    @Slot()
+    def _clear_range(self):
+        self._in_idx = None
+        self._out_idx = None
+        self._update_range_ui()
+
+    def _update_range_ui(self):
+        if not self._datetimes:
+            self._slider.set_marked_range(None, None)
+            self._range_label.setText("—")
+            return
+        lo, hi = self._record_range()
+        self._slider.set_marked_range(lo, hi)
+        n = hi - lo + 1
+        fps = self._fps_spin.value()
+        span = f"{self._datetimes[lo]:%H:%M} → {self._datetimes[hi]:%H:%M}"
+        whole = self._in_idx is None and self._out_idx is None
+        prefix = "full range · " if whole else ""
+        self._range_label.setText(f"{prefix}{span} · {n} frames · {n / fps:.1f} s")
 
     # ── Toolbar handlers ──────────────────────────────────────────────────────
 
@@ -787,6 +950,110 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Screenshot saved to {path}", 4000)
         else:
             QMessageBox.warning(self, "Error", f"Could not save screenshot to:\n{path}")
+
+    # ── Video recording ───────────────────────────────────────────────────────
+
+    @Slot()
+    def _record_video(self):
+        if not self._datetimes or self._recorder is not None:
+            return
+        if ffmpeg_path() is None:
+            QMessageBox.critical(
+                self,
+                "ffmpeg not found",
+                "Recording needs the ffmpeg command-line tool, which is not on "
+                "your PATH.\n\nInstall it (e.g. 'sudo apt install ffmpeg') and "
+                "try again.",
+            )
+            return
+
+        lo, hi = self._record_range()
+        indices = list(range(lo, hi + 1))
+        stem = (
+            self._db_path.with_suffix("") if self._db_path else Path.home() / "density"
+        )
+        suggested = f"{stem}_{self._selected_obs}.mp4"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Video", suggested, "MP4 video (*.mp4);;All files (*)"
+        )
+        if not path:
+            return
+
+        self._begin_record_state()
+        self._record_progress = QProgressDialog(
+            "Loading map tiles…", "Cancel", 0, len(indices), self
+        )
+        self._record_progress.setWindowTitle("Recording")
+        self._record_progress.setWindowModality(Qt.WindowModal)
+        self._record_progress.setMinimumDuration(0)
+        self._record_progress.setAutoClose(False)
+        self._record_progress.setAutoReset(False)
+        self._record_progress.setValue(0)
+
+        self._recorder = VideoRecorder(
+            indices=indices,
+            sink=FFmpegSink(Path(path)),
+            fps=self._fps_spin.value(),
+            apply_frame=self._seek_for_record,
+            capture=lambda: self._map.grab().toImage(),
+            tiles_pending=self._map.pending_tile_count,
+            request_tiles=self._map.request_visible_tiles,
+            parent=self,
+        )
+        self._record_progress.canceled.connect(self._recorder.cancel)
+        self._recorder.progress.connect(self._on_record_progress)
+        self._recorder.finished.connect(self._on_record_finished)
+        self._recorder.start()
+
+    def _seek_for_record(self, idx: int):
+        """Put slider, chart marker and map on timestep *idx*."""
+        if self._slider.value() == idx:
+            # valueChanged does not fire for an unchanged value, so the first
+            # frame (and a one-frame window) would never be drawn.
+            self._apply_timestep(idx)
+        else:
+            self._slider.setValue(idx)  # → _on_slider_changed → _apply_timestep
+
+    @Slot(int, int)
+    def _on_record_progress(self, done: int, total: int):
+        if self._record_progress is not None:
+            self._record_progress.setLabelText(f"Encoding frame {done} of {total}…")
+            self._record_progress.setValue(done)
+
+    @Slot(bool, str)
+    def _on_record_finished(self, ok: bool, message: str):
+        if self._record_progress is not None:
+            self._record_progress.reset()
+            self._record_progress.deleteLater()
+            self._record_progress = None
+
+        recorder, self._recorder = self._recorder, None
+        if recorder is not None:
+            recorder.deleteLater()
+        self._end_record_state()
+
+        if ok:
+            self.statusBar().showMessage(f"Video saved to {message}", 8000)
+        elif message:
+            QMessageBox.warning(self, "Recording failed", message)
+        else:
+            self.statusBar().showMessage("Recording cancelled", 4000)
+
+    def _begin_record_state(self):
+        self._record_saved_state = (self._is_playing, self._current_idx)
+        if self._is_playing:
+            self._toggle_play()
+        self._record_btn.setEnabled(False)
+
+    def _end_record_state(self):
+        self._record_btn.setEnabled(bool(self._datetimes))
+        saved, self._record_saved_state = self._record_saved_state, None
+        if saved is None or not self._datetimes:
+            return
+        was_playing, idx = saved
+        self._seek_for_record(min(idx, len(self._datetimes) - 1))
+        if was_playing and not self._is_playing:
+            self._toggle_play()
 
     # ── Search ────────────────────────────────────────────────────────────────
 
@@ -939,10 +1206,21 @@ class MainWindow(QMainWindow):
         self._clear_btn.setEnabled(loaded)
         self._edge_search_btn.setEnabled(loaded)
         self._node_search_btn.setEnabled(loaded)
+        self._in_btn.setEnabled(loaded)
+        self._out_btn.setEnabled(loaded)
+        self._clear_range_btn.setEnabled(loaded)
+        self._record_btn.setEnabled(loaded)
         if not loaded:
             self._time_label.setText("—")
+            self._range_label.setText("—")
 
     def closeEvent(self, event):
+        # A recording in flight has to be torn down here: once the event loop
+        # stops there is no next tick to notice the cancel, and ffmpeg would
+        # outlive the app holding a half-written file.
+        if self._recorder is not None and self._recorder.is_active():
+            self._recorder.cancel()
+            self._recorder.finish_now()
         # Stop playback and tile loader threads cleanly
         self._timer.stop()
         self._map._pool.waitForDone(2000)
