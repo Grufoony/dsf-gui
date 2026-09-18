@@ -29,24 +29,167 @@ from PySide6.QtGui import QColor
 
 EDGE_OBSERVABLE_CONFIG: dict[str, dict] = {
     "density": {"label": "Density", "reverseColorScale": False},
+    "density_norm": {"label": "Density (normalized)", "reverseColorScale": False},
     "speed": {"label": "Speed", "reverseColorScale": True},
     "n_observations": {"label": "Observations", "reverseColorScale": False},
     "traveltime": {"label": "Travel Time", "reverseColorScale": False},
     "queue_length": {"label": "Queue Length", "reverseColorScale": False},
 }
 
-MAX_DENSITY: float = 200.0
+# Observable selected on startup: every edge measured against its own capacity.
+DEFAULT_OBSERVABLE: str = "density_norm"
+
+# Occupancy at which the normalised-density scale reaches red. Yellow is the
+# midpoint of the ramp, so it lands at half this value (0.15), and anything
+# above stays red all the way to 1. Real traffic sits far below jam density,
+# so a scale that only saturates at 1.0 leaves the map uniformly blue.
+DENSITY_NORM_SATURATION: float = 0.3
+
+# Mean vehicle length is not written to the database, but it is recoverable
+# from it (see estimate_mean_vehicle_length). This is only the fallback for a
+# run that never fills an edge: dsf::mobility::Road::m_meanVehicleLength.
+DSF_DEFAULT_VEHICLE_LENGTH_M: float = 5.0
+
+# A recovered length outside this range means the run never came close to
+# saturating anything and the estimate is an artefact, not a measurement.
+PLAUSIBLE_VEHICLE_LENGTH_M: tuple[float, float] = (2.0, 20.0)
+
+
+# ── Per-edge normalisation ────────────────────────────────────────────────────
+
+
+def lane_metres(edges: list[dict[str, Any]]) -> np.ndarray:
+    """``length_m * nlanes`` per edge — the quantity DSF divides agents by."""
+    length = np.array([float(e.get("length") or 0.0) for e in edges], dtype=np.float64)
+    nlanes = np.array(
+        [max(1, int(e.get("nlanes") or 1)) for e in edges], dtype=np.float64
+    )
+    return length * nlanes
+
+
+def implied_agents(density_vpk: np.ndarray, edges: list[dict[str, Any]]) -> np.ndarray:
+    """
+    Recover DSF's agent count from a stored density.
+
+    DSF writes ``density_vpk = nAgents / (length_m * nlanes) * 1000`` (see
+    FirstOrderDynamics.cpp: ``pStreet->density<false>() * 1e3``) — vehicles per
+    *lane*-kilometre, not per kilometre of road. Multiplying back by the lane
+    metres returns the agent count exactly, give or take the half-agents DSF
+    counts while a vehicle is between two streets.
+    """
+    return density_vpk * lane_metres(edges) / 1000.0
+
+
+def estimate_mean_vehicle_length(
+    conn: sqlite3.Connection, edges: list[dict[str, Any]]
+) -> tuple[float, int]:
+    """
+    Recover the mean vehicle length the simulation ran with, from the data.
+
+    DSF stores neither the length nor the capacity (TrafficSimulator.cpp writes
+    only id/source/target/length/maxspeed/name/nlanes/coilcode/geometry), but it
+    enforces ``nAgents <= capacity = ceil(length_m * nlanes / L)`` on every
+    street at every step. Each edge that was ever busy therefore bounds L:
+
+        ceil(x / L) >= n   =>   x / L > n - 1   =>   L < x / (n - 1)
+
+    for ``x`` lane metres and ``n`` the most agents ever seen on it. The
+    tightest of those bounds is the estimate — edges that actually filled up
+    drive it, and the more of them there are the closer it is pinned.
+
+    The peak is taken over *every* simulation in the file, not just the one
+    being displayed: the length is a property of the network, one quiet run
+    would leave it barely constrained, and a bound from any run is valid for
+    all of them.
+
+    Returns (length_m, n_witnesses), where the witnesses are the edges whose
+    bound lands within 1% of the estimate; one lone witness means a single busy
+    edge is carrying the whole inference. Returns (nan, 0) when nothing was ever
+    busy enough to constrain anything.
+    """
+    id_to_idx = {e["id"]: i for i, e in enumerate(edges)}
+    peak = np.zeros(len(edges), dtype=np.float64)
+    for street_id, max_density in conn.execute(
+        "SELECT street_id, MAX(density_vpk) FROM road_data GROUP BY street_id"
+    ):
+        i = id_to_idx.get(street_id)
+        if i is not None and max_density is not None:
+            peak[i] = max_density
+
+    x = lane_metres(edges)
+    # DSF counts an agent as a half while it straddles two streets, so the
+    # counts live on a 0.5 grid; snap to it before the ceil, or float error
+    # rounds an exact 114 up to 115 and the bound comes out far too tight.
+    n = np.ceil(np.round(implied_agents(peak, edges) * 2.0) / 2.0)
+    usable = (n >= 2) & (x > 0)
+    if not usable.any():
+        return float("nan"), 0
+    bounds = x[usable] / (n[usable] - 1.0)
+    # The bound is strict (L < …), so step just inside it: landing exactly on it
+    # would round some edge's capacity down and push it past full.
+    estimate = float(bounds.min()) * (1.0 - 1e-9)
+    witnesses = int((bounds <= bounds.min() * 1.01).sum())
+    return estimate, witnesses
+
+
+def edge_capacity(edges: list[dict[str, Any]], vehicle_length_m: float) -> np.ndarray:
+    """
+    Per-edge capacity in vehicles, exactly as DSF computes it:
+
+        capacity = ceil(length_m * nlanes / L)   (>= 1)
+
+    See Road::Road in DynamicalSystemFramework/src/dsf/mobility/Road.cpp. The
+    ceil is not cosmetic: on edges shorter than a couple of vehicles it is what
+    keeps a single agent from reading as several times "full".
+    """
+    return np.maximum(1.0, np.ceil(lane_metres(edges) / vehicle_length_m))
+
+
+def jam_density_vpk(edges: list[dict[str, Any]], vehicle_length_m: float) -> np.ndarray:
+    """
+    Per-edge density, in the units of ``density_vpk``, at which an edge is full.
+
+    Dividing a stored density by this gives DSF's own ``nAgents / capacity``:
+    the implied agent count cancels and what is left is the occupancy the
+    simulation itself caps at 1. It sits near ``1000 / vehicle_length_m`` for
+    ordinary edges and rises above it for edges short enough that the ceil in
+    edge_capacity rounds their capacity up.
+    """
+    x = lane_metres(edges)
+    jam = np.zeros(len(edges), dtype=np.float32)
+    ok = x > 0
+    jam[ok] = 1000.0 * edge_capacity(edges, vehicle_length_m)[ok] / x[ok]
+    return jam
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
+
+
+def ramp_color(t: float) -> tuple[int, int, int]:
+    """
+    The colour scale, as (r, g, b), for *t* in [0, 1]: blue → yellow → red.
+
+    Blue rather than green at the low end so the scale stays readable with
+    red-green colour vision deficiency: blue↔yellow↔red varies in both hue and
+    lightness, which green→yellow→red does not.
+
+    Single source of truth for the scale - the legend and the vectorised
+    edge colouring below both go through it (or mirror it exactly).
+    """
+    t = max(0.0, min(1.0, t))
+    if t <= 0.5:
+        s = t * 2  # 0 → 1 over the first half:  blue → yellow
+        return int(s * 255), int(s * 255), int((1.0 - s) * 255)
+    s = (t - 0.5) * 2  # 0 → 1 over the second half: yellow → red
+    return 255, int((1.0 - s) * 255), 0
 
 
 def value_to_qcolor(
     value: float, dmin: float, dmax: float, reversed_: bool = False, alpha: int = 176
 ) -> QColor:
     """
-    Map *value* in [dmin, dmax] to a QColor on the green→yellow→red scale.
-    Pass reversed_=True for red→yellow→green (used for speed).
+    Map *value* in [dmin, dmax] to a QColor on the blue→yellow→red scale.
+    Pass reversed_=True for red→yellow→blue (used for speed).
     alpha=176 ≈ 0.69 x 255, matching the JS rgba(…, 0.69).
 
     Kept for single-value use (e.g. tooltips); bulk colouring should use
@@ -58,16 +201,8 @@ def value_to_qcolor(
     if reversed_:
         t = 1.0 - t
 
-    if t <= 0.5:
-        s = t * 2  # 0 → 1 over the first half
-        r = int(s * 255)  #   0 → 255
-        g = int(128 + s * 127)  # 128 → 255
-    else:
-        s = (t - 0.5) * 2  # 0 → 1 over the second half
-        r = 255
-        g = int((1.0 - s) * 255)  # 255 → 0
-
-    return QColor(r, g, 0, alpha)
+    r, g, b = ramp_color(t)
+    return QColor(r, g, b, alpha)
 
 
 def _row_to_colors(
@@ -87,22 +222,55 @@ def _row_to_colors(
     if reversed_:
         t = 1.0 - t
 
+    # Vectorised mirror of ramp_color(): blue → yellow → red.
     r = np.empty_like(t)
     g = np.empty_like(t)
+    b = np.empty_like(t)
     lo = t <= 0.5
     hi = ~lo
 
     s1 = t[lo] * 2
     r[lo] = s1 * 255
-    g[lo] = 128 + s1 * 127
+    g[lo] = s1 * 255
+    b[lo] = (1.0 - s1) * 255
 
     s2 = (t[hi] - 0.5) * 2
     r[hi] = 255
     g[hi] = (1.0 - s2) * 255
+    b[hi] = 0
 
     r_list = r.astype(np.uint8).tolist()
     g_list = g.astype(np.uint8).tolist()
-    return [QColor(ri, gi, 0, alpha) for ri, gi in zip(r_list, g_list)]
+    b_list = b.astype(np.uint8).tolist()
+    return [QColor(ri, gi, bi, alpha) for ri, gi, bi in zip(r_list, g_list, b_list)]
+
+
+def observable_row(
+    key: str,
+    idx: int,
+    values: dict[str, np.ndarray],
+    jam: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Values of observable *key* at timestep *idx*, one entry per edge.
+
+    "density_norm" is derived on the fly from the stored density array divided
+    by *jam* (see jam_density_vpk), so no second (T, n_edges) array is kept in
+    memory. The result is DSF's own nAgents/capacity, which the simulation caps
+    at 1 (an edge cannot hold more agents than its capacity); it is clipped to
+    [0, 1] anyway, so a fallback capacity model cannot push a colour off scale.
+    """
+    src = "density" if key == "density_norm" else key
+    arr = values.get(src)
+    if arr is None or idx >= len(arr):
+        return np.zeros(0, dtype=np.float32)
+    row = np.nan_to_num(arr[idx], nan=0.0)
+    if key != "density_norm":
+        return row
+    if jam is None or jam.size != row.size:
+        return row
+    out = np.divide(row, jam, out=np.zeros_like(row), where=jam > 0)
+    return np.clip(out, 0.0, 1.0)
 
 
 def edge_colors_for_timestep(
@@ -111,18 +279,20 @@ def edge_colors_for_timestep(
     values: dict[str, np.ndarray],
     domains: dict[str, tuple[float, float]],
     alpha: int = 176,
+    jam: np.ndarray | None = None,
 ) -> list[QColor]:
     """
     Build the QColor list for ONE timestep of ONE observable, on demand.
     Call this from the UI whenever the slider moves / the observable
     changes - it's cheap (O(n_edges)) and replaces precompute_all_colors().
+
+    Pass *jam* (from jam_density_vpk) to enable the "density_norm" observable.
     """
-    arr = values.get(key)
-    if arr is None or idx >= len(arr):
+    row = observable_row(key, idx, values, jam)
+    if row.size == 0:
         return []
     dmin, dmax = domains.get(key, (0.0, 1.0))
     rev = EDGE_OBSERVABLE_CONFIG.get(key, {}).get("reverseColorScale", False)
-    row = np.nan_to_num(arr[idx], nan=0.0)
     return _row_to_colors(row, dmin, dmax, rev, alpha)
 
 
@@ -213,6 +383,9 @@ def load_road_data(
             "queue_length":   np.ndarray,
         },
         "domains": {"density": (min, max), "speed": …, …},
+        "jam_density": np.ndarray,                   # (n_edges,) vpk at capacity
+        "vehicle_length_m": float,                   # recovered from the data
+        "vehicle_length_source": str,                # how it was arrived at
     }
 
     """
@@ -306,8 +479,30 @@ def load_road_data(
         return (mn, mn + 1.0) if mn == mx else (mn, mx)
 
     domains = {k: _domain(v) for k, v in values.items()}
+    # Normalised density is an occupancy fraction, so its scale is fixed rather
+    # than data-driven - every edge is measured against its own capacity.
+    domains["density_norm"] = (0.0, DENSITY_NORM_SATURATION)
 
-    return {"datetimes": datetimes, "values": values, "domains": domains}
+    # Recover the capacity model from the data rather than assuming one.
+    vehicle_length, witnesses = estimate_mean_vehicle_length(conn, edges)
+    lo, hi = PLAUSIBLE_VEHICLE_LENGTH_M
+    if not (np.isfinite(vehicle_length) and lo <= vehicle_length <= hi):
+        source = (
+            f"no edge in this run ever filled up — assuming DSF's default "
+            f"{DSF_DEFAULT_VEHICLE_LENGTH_M:g} m"
+        )
+        vehicle_length = DSF_DEFAULT_VEHICLE_LENGTH_M
+    else:
+        source = f"measured from {witnesses} saturated edge(s)"
+
+    return {
+        "datetimes": datetimes,
+        "values": values,
+        "domains": domains,
+        "jam_density": jam_density_vpk(edges, vehicle_length),
+        "vehicle_length_m": vehicle_length,
+        "vehicle_length_source": source,
+    }
 
 
 def load_global_data(

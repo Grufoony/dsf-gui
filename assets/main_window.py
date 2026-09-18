@@ -20,8 +20,10 @@ QMainWindow that wires everything together:
 
 from __future__ import annotations
 
+import math
 import sqlite3
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QPainter
 from PySide6.QtWidgets import (
@@ -46,13 +48,16 @@ from PySide6.QtWidgets import (
 )
 
 from .database import (
+    DEFAULT_OBSERVABLE,
+    DENSITY_NORM_SATURATION,
     EDGE_OBSERVABLE_CONFIG,
-    MAX_DENSITY,
     edge_colors_for_timestep,
     get_simulations,
     load_edges,
     load_global_data,
     load_road_data,
+    observable_row,
+    ramp_color,
 )
 from .map_widget import MapWidget
 
@@ -69,12 +74,13 @@ except ImportError:
 
 
 class LegendWidget(QWidget):
-    """Draws a green→yellow→red gradient bar with domain labels."""
+    """Draws a blue→yellow→red gradient bar with domain labels."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._label = "Density"
-        self._domain = (0.0, MAX_DENSITY)
+        cfg = EDGE_OBSERVABLE_CONFIG[DEFAULT_OBSERVABLE]
+        self._label = cfg["label"]
+        self._domain = (0.0, DENSITY_NORM_SATURATION)  # normalised occupancy
         self._reversed = False
         self.setFixedHeight(58)
         self.setMinimumWidth(160)
@@ -96,19 +102,15 @@ class LegendWidget(QWidget):
         p.setFont(QFont("Arial", 8, QFont.Bold))
         p.drawText(2, 12, self._label)
 
-        # Gradient bar  (y = 18..35)
+        # Gradient bar  (y = 18..35) — same ramp the edges are coloured with
         for i in range(w):
             t = i / max(1, w - 1)
             if self._reversed:
                 t = 1.0 - t
-            if t <= 0.5:
-                s = t * 2
-                r, g = int(s * 255), int(128 + s * 127)
-            else:
-                s = (t - 0.5) * 2
-                r, g = 255, int((1.0 - s) * 255)
-            p.setPen(QColor(r, g, 0))
-            p.drawLine(i, 18, i, 35)
+            r, g, b = ramp_color(t)
+            # fillRect, not drawLine: an antialiased 1px line blends with its
+            # neighbours and washes the bar out relative to the actual edges.
+            p.fillRect(i, 18, 1, 17, QColor(r, g, b))
 
         # Border
         p.setPen(QColor(120, 120, 120))
@@ -322,9 +324,12 @@ class MainWindow(QMainWindow):
         self._datetimes: list = []  # one datetime per timestep
         self._values: dict[str, np.ndarray] = {}  # key -> (T, n_edges) float32 array
         self._obs_domains: dict[str, tuple] = {}
+        self._jam: np.ndarray | None = None  # (n_edges,) jam density in vpk
+        self._vehicle_length: float = float("nan")  # recovered from the data
+        self._vehicle_length_source: str = ""
         self._global_data: list[dict] = []
         self._current_idx: int = 0
-        self._selected_obs: str = "density"
+        self._selected_obs: str = DEFAULT_OBSERVABLE
         self._is_playing: bool = False
         self._highlighted_edge: dict | None = None
 
@@ -366,8 +371,27 @@ class MainWindow(QMainWindow):
         self._obs_combo = QComboBox()
         for key, cfg in EDGE_OBSERVABLE_CONFIG.items():
             self._obs_combo.addItem(cfg["label"], userData=key)
+        default_idx = list(EDGE_OBSERVABLE_CONFIG).index(self._selected_obs)
+        self._obs_combo.setCurrentIndex(default_idx)
         self._obs_combo.currentIndexChanged.connect(self._on_obs_changed)
         tb.addWidget(self._obs_combo)
+
+        # Upper end of the colour scale for the normalised density, as a
+        # fraction of each edge's own capacity: the occupancy that reads red.
+        # Only meaningful for "Density (normalized)".
+        self._norm_max_label = tb.addWidget(QLabel(" Scale max: "))
+        self._norm_max_spin = QDoubleSpinBox()
+        self._norm_max_spin.setDecimals(2)
+        self._norm_max_spin.setRange(0.01, 1.0)
+        self._norm_max_spin.setSingleStep(0.05)
+        self._norm_max_spin.setValue(DENSITY_NORM_SATURATION)
+        self._norm_max_spin.setToolTip(
+            "Occupancy that maps to red; yellow falls at half of it "
+            "(1.00 = bumper to bumper)"
+        )
+        self._norm_max_spin.valueChanged.connect(self._on_norm_max_changed)
+        self._norm_max_action = tb.addWidget(self._norm_max_spin)
+        self._update_norm_max_visibility()
         tb.addSeparator()
 
         # Screenshot
@@ -602,6 +626,10 @@ class MainWindow(QMainWindow):
         self._datetimes = bundle["datetimes"]
         self._values = bundle["values"]
         self._obs_domains = bundle["domains"]
+        self._jam = bundle.get("jam_density")
+        self._vehicle_length = bundle.get("vehicle_length_m", float("nan"))
+        self._vehicle_length_source = bundle.get("vehicle_length_source", "")
+        self._obs_domains["density_norm"] = (0.0, self._norm_max_spin.value())
         self._global_data = global_data
         self._current_idx = 0
         self._highlighted_edge = None
@@ -636,7 +664,11 @@ class MainWindow(QMainWindow):
         # First frame
         self._apply_timestep(0)
         self._set_data_loaded(True)
-        self.statusBar().showMessage(f"Loaded {len(edges)} edges · {n} timesteps", 5000)
+        self.statusBar().showMessage(
+            f"Loaded {len(edges)} edges · {n} timesteps · vehicle length "
+            f"{self._vehicle_length:.2f} m ({self._vehicle_length_source})",
+            15000,
+        )
 
     # ── Visualization update ──────────────────────────────────────────────────
 
@@ -646,18 +678,20 @@ class MainWindow(QMainWindow):
 
         key = self._selected_obs
         colors = (
-            edge_colors_for_timestep(key, idx, self._values, self._obs_domains)
+            edge_colors_for_timestep(
+                key, idx, self._values, self._obs_domains, jam=self._jam
+            )
             if self._values
             else []
         )
-        dens = (
-            self._values["density"][idx].tolist()
-            if self._values and idx < len(self._values.get("density", []))
+        occupancy = (
+            observable_row("density_norm", idx, self._values, self._jam).tolist()
+            if self._values
             else []
         )
 
         self._map.set_edge_colors(colors)
-        self._map.set_edge_densities(dens)
+        self._map.set_edge_occupancy(occupancy)
 
         # Update time label
         dt = self._datetimes[idx]
@@ -722,9 +756,22 @@ class MainWindow(QMainWindow):
         key = self._obs_combo.currentData()
         if key and key != self._selected_obs:
             self._selected_obs = key
+            self._update_norm_max_visibility()
             self._refresh_legend()
             if self._datetimes:
                 self._apply_timestep(self._current_idx)
+
+    def _update_norm_max_visibility(self):
+        show = self._selected_obs == "density_norm"
+        self._norm_max_label.setVisible(show)
+        self._norm_max_action.setVisible(show)
+
+    @Slot(float)
+    def _on_norm_max_changed(self, value: float):
+        self._obs_domains["density_norm"] = (0.0, value)
+        self._refresh_legend()
+        if self._datetimes and self._selected_obs == "density_norm":
+            self._apply_timestep(self._current_idx)
 
     def _take_screenshot(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -842,12 +889,21 @@ class MainWindow(QMainWindow):
 
     def _show_edge_info(self, edge: dict, ts_idx: int):
         density = "N/A"
+        norm_density = "N/A"
+        capacity = "N/A"
+        if math.isfinite(self._vehicle_length) and edge.get("length"):
+            lane_m = float(edge["length"]) * max(1, int(edge.get("nlanes") or 1))
+            capacity = f"{max(1, math.ceil(lane_m / self._vehicle_length))} vehicles"
         dens_arr = self._values.get("density") if self._values else None
         if dens_arr is not None and ts_idx < len(dens_arr):
             try:
                 edge_pos = self._edges.index(edge)
                 d = dens_arr[ts_idx][edge_pos]
-                density = f"{d:.2f}"
+                density = f"{d:.2f} veh/km"
+                if self._jam is not None and edge_pos < len(self._jam):
+                    jam = float(self._jam[edge_pos])
+                    if jam > 0:
+                        norm_density = f"{d / jam:.3f}  ({d / jam * 100:.1f} %)"
             except ValueError, IndexError:
                 pass
 
@@ -859,6 +915,8 @@ class MainWindow(QMainWindow):
             f"<b>Max Speed:</b> {edge.get('maxspeed', 'N/A')}<br>"
             f"<b>Lanes:</b> {edge.get('nlanes', 'N/A')}<br>"
             f"<b>Density:</b> {density}<br>"
+            f"<b>Norm. Density:</b> {norm_density}<br>"
+            f"<b>Capacity:</b> {capacity}<br>"
             f"<b>Coil Code:</b> {edge.get('coilcode', 'N/A')}"
         )
 

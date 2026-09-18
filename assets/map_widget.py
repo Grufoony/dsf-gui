@@ -171,7 +171,7 @@ class MapWidget(QWidget):
         # ── Edge data ──────────────────────────────────────────────────────
         self.edges: list[dict] = []
         self.edge_colors: list[QColor] = []
-        self.edge_densities: list[float] = []
+        self.edge_occupancy: list[float] = []  # density / jam density, per edge
         self.highlighted_edge_id = None
         self.highlighted_node: tuple[float, float] | None = None  # (lon, lat)
 
@@ -225,15 +225,16 @@ class MapWidget(QWidget):
         self._geo_zoom = None
         n = len(edges)
         self.edge_colors = [QColor(0, 128, 0, 176)] * n
-        self.edge_densities = [0.0] * n
+        self.edge_occupancy = [0.0] * n
         self.update()
 
     def set_edge_colors(self, colors: list[QColor]):
         self.edge_colors = colors
         self.update()
 
-    def set_edge_densities(self, densities: list[float]):
-        self.edge_densities = densities
+    def set_edge_occupancy(self, occupancy: list[float]):
+        """Per-edge occupancy in [0, 1] (density / jam density); drives line width."""
+        self.edge_occupancy = occupancy
         self.update()
 
     def set_tile_filter(self, mode: str):
@@ -432,7 +433,8 @@ class MapWidget(QWidget):
                     p.drawPixmap(int(tx * 256 - left), int(ty * 256 - top), pm)
 
     def _draw_edges(self, p: QPainter):
-        MAX_D = 200.0
+        # Widths scale with occupancy, so a full edge is wide whatever its size.
+        FULL = 1.0
         base_w = max(1.0, 3.0 + self.zoom - 13)
         cx, cy = self._cx, self._cy
         hw, hh = self.width() * 0.5, self.height() * 0.5
@@ -463,8 +465,8 @@ class MapWidget(QWidget):
             if hi_id and edge["id"] == hi_id:
                 continue  # drawn last, on top
 
-            density = self.edge_densities[i] if i < len(self.edge_densities) else 0.0
-            df = min(density / MAX_D, 2.0)
+            occ = self.edge_occupancy[i] if i < len(self.edge_occupancy) else 0.0
+            df = min(occ / FULL, 2.0)
             width = max(1.0, base_w * (0.5 + df))
             color = (
                 self.edge_colors[i]
@@ -495,10 +497,8 @@ class MapWidget(QWidget):
                 poly = self._geo_polygons[i]
                 if poly.isEmpty():
                     break
-                density = (
-                    self.edge_densities[i] if i < len(self.edge_densities) else 0.0
-                )
-                df = min(density / MAX_D, 2.0)
+                occ = self.edge_occupancy[i] if i < len(self.edge_occupancy) else 0.0
+                df = min(occ / FULL, 2.0)
                 width = max(1.0, base_w * (0.5 + df)) * 1.5
                 pen.setColor(QColor(255, 255, 255, 230))
                 pen.setWidthF(width)
