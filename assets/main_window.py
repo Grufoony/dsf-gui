@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QPainter
+from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -64,7 +64,14 @@ from .database import (
     ramp_color,
 )
 from .map_widget import MapWidget
-from .video_export import FFmpegSink, VideoRecorder, ffmpeg_path
+from .overlays import (
+    CHART_SIZES,
+    DEFAULT_CHART_SIZE,
+    OverlayCompositor,
+    format_tick,
+    pretty_metric,
+)
+from .video_export import FFmpegSink, VideoRecorder, even_size, ffmpeg_path, fit
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -128,19 +135,12 @@ class LegendWidget(QWidget):
         dmin, dmax = self._domain
         dmid = (dmin + dmax) / 2
 
-        def fmt(v: float) -> str:
-            if abs(v) >= 1000:
-                return f"{v:.0f}"
-            if abs(v) >= 100:
-                return f"{v:.0f}"
-            if abs(v) >= 10:
-                return f"{v:.1f}"
-            return f"{v:.2f}"
-
+        # format_tick is shared with the legend burned into recorded video, so
+        # the two can never disagree about how a domain is written.
         fm = p.fontMetrics()
-        min_s = fmt(dmin)
-        mid_s = fmt(dmid)
-        max_s = fmt(dmax)
+        min_s = format_tick(dmin)
+        mid_s = format_tick(dmid)
+        max_s = format_tick(dmax)
         mid_x = (w - fm.horizontalAdvance(mid_s)) // 2
         max_x = w - fm.horizontalAdvance(max_s)
         p.drawText(2, 54, min_s)
@@ -276,6 +276,20 @@ class ChartWidget(QWidget):
         self._current_idx = idx
         self._update_marker()
 
+    def current_series(self) -> tuple[str, list[float]] | None:
+        """
+        (column, one value per timestep) for whatever the chart is showing.
+
+        Used to redraw the same curve into recorded video. The video panel is
+        re-rendered from the data rather than grabbed from this widget because
+        _update_marker ends in draw_idle(), which defers to the next event-loop
+        turn - a grab taken inside a frame capture would carry a stale marker.
+        """
+        if not self._global_data or not self._current_col:
+            return None
+        col = self._current_col
+        return col, [float(d.get(col, 0) or 0.0) for d in self._global_data]
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _on_col_changed(self, text: str):
@@ -405,6 +419,7 @@ class MainWindow(QMainWindow):
         self._recorder: VideoRecorder | None = None
         self._record_progress: QProgressDialog | None = None
         self._record_saved_state: tuple[bool, int] | None = None
+        self._overlays: OverlayCompositor | None = None
 
         # Playback timer
         self._timer = QTimer(self)
@@ -645,6 +660,16 @@ class MainWindow(QMainWindow):
         self._range_label.setStyleSheet("font-size: 10px; color: #555;")
         layout.addWidget(self._range_label)
 
+        # Size of the chart panel burned into the video ("No chart" turns it off)
+        self._chart_size_combo = QComboBox()
+        self._chart_size_combo.addItems(list(CHART_SIZES))
+        self._chart_size_combo.setCurrentText(DEFAULT_CHART_SIZE)
+        self._chart_size_combo.setFixedWidth(92)
+        self._chart_size_combo.setToolTip(
+            "Size of the load chart drawn into the recorded video"
+        )
+        layout.addWidget(self._chart_size_combo)
+
         self._record_btn = QPushButton("⏺  Record")
         self._record_btn.setFixedHeight(28)
         self._record_btn.setToolTip("Record the selected time window to an MP4 video")
@@ -817,11 +842,25 @@ class MainWindow(QMainWindow):
         if self._highlighted_edge:
             self._show_edge_info(self._highlighted_edge, idx)
 
-    def _refresh_legend(self):
+    def _legend_spec(self) -> tuple[str, tuple[float, float], bool]:
+        """
+        What the legend currently says: (label, domain, reversed).
+
+        One place decides this, so the side-panel legend and the one burned into
+        a recording always agree - including a "Scale max" the user has changed,
+        which lives in _obs_domains.
+        """
         key = self._selected_obs
-        domain = self._obs_domains.get(key, (0.0, 1.0))
-        rev = EDGE_OBSERVABLE_CONFIG.get(key, {}).get("reverseColorScale", False)
-        self._legend.set_observable(key, domain, rev)
+        cfg = EDGE_OBSERVABLE_CONFIG.get(key, {})
+        return (
+            cfg.get("label", key),
+            self._obs_domains.get(key, (0.0, 1.0)),
+            cfg.get("reverseColorScale", False),
+        )
+
+    def _refresh_legend(self):
+        _label, domain, rev = self._legend_spec()
+        self._legend.set_observable(self._selected_obs, domain, rev)
 
     # ── Slider / playback ─────────────────────────────────────────────────────
 
@@ -980,6 +1019,22 @@ class MainWindow(QMainWindow):
             return
 
         self._begin_record_state()
+
+        # Panels for the burned-in overlay, built from what the UI is showing
+        # right now. Rendering happens on the first frame, when the real pixel
+        # size is known.
+        label, domain, rev = self._legend_spec()
+        series = self._chart.current_series()
+        self._overlays = OverlayCompositor(
+            legend_label=label,
+            legend_domain=domain,
+            legend_reversed=rev,
+            chart_title=pretty_metric(series[0]) if series else "",
+            chart_values=series[1] if series else (),
+            chart_fraction=CHART_SIZES.get(self._chart_size_combo.currentText(), 0.0),
+            highlight=(lo, hi),
+        )
+
         self._record_progress = QProgressDialog(
             "Loading map tiles…", "Cancel", 0, len(indices), self
         )
@@ -995,7 +1050,7 @@ class MainWindow(QMainWindow):
             sink=FFmpegSink(Path(path)),
             fps=self._fps_spin.value(),
             apply_frame=self._seek_for_record,
-            capture=lambda: self._map.grab().toImage(),
+            capture=self._capture_record_frame,
             tiles_pending=self._map.pending_tile_count,
             request_tiles=self._map.request_visible_tiles,
             parent=self,
@@ -1004,6 +1059,28 @@ class MainWindow(QMainWindow):
         self._recorder.progress.connect(self._on_record_progress)
         self._recorder.finished.connect(self._on_record_finished)
         self._recorder.start()
+
+    def _capture_record_frame(self) -> QImage:
+        """One video frame: the map grab with the overlay panels burned in."""
+        img = self._map.grab().toImage()
+        # A HiDPI grab carries devicePixelRatio 2, which would make QPainter
+        # read our device-pixel coordinates as logical ones and draw every
+        # panel at half scale.
+        img.setDevicePixelRatio(1.0)
+        if img.format() != QImage.Format_RGB32:
+            img = img.convertToFormat(QImage.Format_RGB32)
+
+        overlays = self._overlays
+        if overlays is None:
+            return img
+        if overlays.size is None:
+            overlays.prepare(even_size(img.size()))
+        # Normalise to the pinned size *before* compositing, so that resizing
+        # the window mid-recording cannot push a panel outside the frame and
+        # have video_export's own fit() crop it.
+        img = fit(img, overlays.size)
+        overlays.composite(img, self._current_idx)
+        return img
 
     def _seek_for_record(self, idx: int):
         """Put slider, chart marker and map on timestep *idx*."""
@@ -1030,6 +1107,7 @@ class MainWindow(QMainWindow):
         recorder, self._recorder = self._recorder, None
         if recorder is not None:
             recorder.deleteLater()
+        self._overlays = None  # drop the rendered panels
         self._end_record_state()
 
         if ok:
@@ -1209,6 +1287,7 @@ class MainWindow(QMainWindow):
         self._in_btn.setEnabled(loaded)
         self._out_btn.setEnabled(loaded)
         self._clear_range_btn.setEnabled(loaded)
+        self._chart_size_combo.setEnabled(loaded)
         self._record_btn.setEnabled(loaded)
         if not loaded:
             self._time_label.setText("—")
