@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime
 import sqlite3
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -53,6 +54,10 @@ DSF_DEFAULT_VEHICLE_LENGTH_M: float = 5.0
 # A recovered length outside this range means the run never came close to
 # saturating anything and the estimate is an artefact, not a measurement.
 PLAUSIBLE_VEHICLE_LENGTH_M: tuple[float, float] = (2.0, 20.0)
+
+# How often load_road_data reports progress. ~30 calls over a 3.6M-row
+# simulation: often enough to feel live, rare enough to cost nothing.
+PROGRESS_ROW_INTERVAL = 100_000
 
 
 # ── Per-edge normalisation ────────────────────────────────────────────────────
@@ -363,13 +368,32 @@ def _travel_time_expr(conn: sqlite3.Connection) -> str:
     )
 
 
+class LoadCancelled(Exception):
+    """Raised out of load_road_data when progress_cb asks it to stop."""
+
+
 def load_road_data(
     conn: sqlite3.Connection,
     edges: list[dict],
     sim_id: int,
+    *,
+    vehicle_length: float | None = None,
+    progress_cb: Callable[[int], bool] | None = None,
 ) -> dict[str, Any]:
     """
     Load per-edge time-series data for simulation *sim_id*.
+
+    This is the expensive call in the app - seconds of full-table scan - so it
+    takes two optional hooks for callers that run it off the GUI thread:
+
+    progress_cb(rows_read)
+        Called every PROGRESS_ROW_INTERVAL rows. Return False to abort, which
+        raises LoadCancelled.
+    vehicle_length
+        Skips estimate_mean_vehicle_length, which scans *every* simulation in
+        the file and so gives the same answer for all of them: a caller
+        switching simulations within one file can pass the value it already has
+        and save that second scan.
 
     Returns
     -------
@@ -434,7 +458,15 @@ def load_road_data(
         nobs_frames.append(nm.copy())
         queue_frames.append(qm.copy())
 
+    rows = 0
     for ts, sid, d, s, t, n, q in cur:
+        rows += 1
+        if (
+            progress_cb is not None
+            and rows % PROGRESS_ROW_INTERVAL == 0
+            and not progress_cb(rows)
+        ):
+            raise LoadCancelled
         if ts != cur_ts:
             if cur_ts is not None:
                 _flush(cur_ts)
@@ -483,7 +515,18 @@ def load_road_data(
     # than data-driven - every edge is measured against its own capacity.
     domains["density_norm"] = (0.0, DENSITY_NORM_SATURATION)
 
-    # Recover the capacity model from the data rather than assuming one.
+    # Recover the capacity model from the data rather than assuming one - unless
+    # the caller already has it for this file.
+    if vehicle_length is not None:
+        return {
+            "datetimes": datetimes,
+            "values": values,
+            "domains": domains,
+            "jam_density": jam_density_vpk(edges, vehicle_length),
+            "vehicle_length_m": vehicle_length,
+            "vehicle_length_source": "carried over from this database",
+        }
+
     vehicle_length, witnesses = estimate_mean_vehicle_length(conn, edges)
     lo, hi = PLAUSIBLE_VEHICLE_LENGTH_M
     if not (np.isfinite(vehicle_length) and lo <= vehicle_length <= hi):

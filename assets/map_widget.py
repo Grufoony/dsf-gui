@@ -138,7 +138,8 @@ class _TileJob(QRunnable):
             )
             if r.status_code == 200 and r.content:
                 payload = r.content
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - a tile fetch on a worker
+            # thread; any network failure just leaves payload empty below
             pass
         try:
             # Emit raw bytes — QPixmap is created in the main thread below.

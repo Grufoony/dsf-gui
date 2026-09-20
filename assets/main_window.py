@@ -25,10 +25,9 @@ import sqlite3
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
-    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -58,8 +57,6 @@ from .database import (
     edge_colors_for_timestep,
     get_simulations,
     load_edges,
-    load_global_data,
-    load_road_data,
     observable_row,
     ramp_color,
 )
@@ -71,6 +68,7 @@ from .overlays import (
     format_tick,
     pretty_metric,
 )
+from .sim_loader import SimulationLoader
 from .video_export import FFmpegSink, VideoRecorder, even_size, ffmpeg_path, fit
 
 try:
@@ -80,6 +78,33 @@ try:
     _HAS_MPL = True
 except ImportError:
     _HAS_MPL = False
+
+
+def _nearest_time_index(old_datetimes: list, old_idx: int, new_datetimes: list) -> int:
+    """
+    The entry of *new_datetimes* closest in time-of-day to where we were.
+
+    Switching between runs of different days should land on the same moment of
+    the day, not the same row number. When both runs share a timestep grid -
+    the usual case - this returns the identical index.
+    """
+    if not new_datetimes:
+        return 0
+    if not old_datetimes or not 0 <= old_idx < len(old_datetimes):
+        return 0
+    if len(old_datetimes) == len(new_datetimes):
+        return old_idx
+    target = old_datetimes[old_idx]
+    seconds = target.hour * 3600 + target.minute * 60 + target.second
+    return min(
+        range(len(new_datetimes)),
+        key=lambda i: abs(
+            new_datetimes[i].hour * 3600
+            + new_datetimes[i].minute * 60
+            + new_datetimes[i].second
+            - seconds
+        ),
+    )
 
 
 # ── Legend widget ─────────────────────────────────────────────────────────────
@@ -255,7 +280,12 @@ class ChartWidget(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_global_data(self, data: list[dict]):
+    def set_global_data(self, data: list[dict], keep_column: str | None = None):
+        """
+        Replace the series. *keep_column* survives a simulation switch, if the
+        new data still has it - otherwise the selection silently snaps back to
+        mean_density_vpk on every switch.
+        """
         self._global_data = data
         if not data:
             return
@@ -263,7 +293,7 @@ class ChartWidget(QWidget):
         self._col_selector.blockSignals(True)
         self._col_selector.clear()
         self._col_selector.addItems(cols)
-        preferred = "mean_density_vpk"
+        preferred = keep_column if keep_column in cols else "mean_density_vpk"
         self._current_col = (
             preferred if preferred in cols else (cols[0] if cols else "")
         )
@@ -275,6 +305,10 @@ class ChartWidget(QWidget):
     def set_current_index(self, idx: int):
         self._current_idx = idx
         self._update_marker()
+
+    def current_column(self) -> str:
+        """The metric currently plotted, so a caller can restore it later."""
+        return self._current_col
 
     def current_series(self) -> tuple[str, list[float]] | None:
         """
@@ -327,7 +361,8 @@ class ChartWidget(QWidget):
         if self._marker_line is not None:
             try:
                 self._marker_line.remove()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - best-effort cleanup of a
+                # stale artist; any failure here just means it is already gone
                 pass
             self._marker_line = None
 
@@ -342,7 +377,7 @@ class ChartWidget(QWidget):
         if event.inaxes != self._ax or event.xdata is None:
             return None
         n = len(self._global_data)
-        return max(0, min(n - 1, int(round(event.xdata))))
+        return max(0, min(n - 1, round(event.xdata)))
 
     def _mpl_press(self, event):
         idx = self._chart_x_to_index(event)
@@ -409,8 +444,19 @@ class MainWindow(QMainWindow):
         self._is_playing: bool = False
         self._highlighted_edge: dict | None = None
 
+        # ── Loaded file / simulation ───────────────────────────────────────
+        self._db_path: Path | None = None
+        self._simulations: list[dict] = []
+        self._sim_id: int | None = None
+        # The vehicle length is measured over every simulation in a file, so it
+        # is cached here and the second scan skipped on a switch.
+        self._file_vehicle_length: float | None = None
+        self._sim_loader: SimulationLoader | None = None
+        self._sim_thread: QThread | None = None
+        self._sim_load_progress: QProgressDialog | None = None
+        self._sim_reuse_geometry: bool = False
+
         # ── Recording state ────────────────────────────────────────────────
-        self._db_path: Path | None = None  # for the default video filename
         # Chosen window; None means "whichever end of the timeline".
         self._in_idx: int | None = None
         self._out_idx: int | None = None
@@ -444,6 +490,16 @@ class MainWindow(QMainWindow):
         act_load.setToolTip("Open a simulation SQLite database")
         act_load.triggered.connect(self._load_db)
         tb.addAction(act_load)
+
+        # Simulation selector — switches run in place, keeping the map view
+        tb.addWidget(QLabel(" Simulation: "))
+        self._sim_combo = QComboBox()
+        self._sim_combo.setMinimumWidth(190)
+        self._sim_combo.setToolTip(
+            "Switch simulation without moving the map or losing the time position"
+        )
+        self._sim_combo.currentIndexChanged.connect(self._on_sim_combo_changed)
+        tb.addWidget(self._sim_combo)
         tb.addSeparator()
 
         # Tile style
@@ -698,7 +754,7 @@ class MainWindow(QMainWindow):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-        except Exception as exc:
+        except sqlite3.Error as exc:
             QMessageBox.critical(self, "Error", f"Cannot open database:\n{exc}")
             return
 
@@ -722,40 +778,176 @@ class MainWindow(QMainWindow):
             sim_id = sims[0]["id"]
         else:
             dlg = SimulationDialog(sims, self)
-            if dlg.exec() != QDialog.Accepted:
-                return
+            accepted = dlg.exec() == QDialog.Accepted
             sim_id = dlg.selected_id()
+            # The dialog is parented to the window, so without this it lingers
+            # as a dead child for the life of the app - one per Load Database.
+            dlg.deleteLater()
+            if not accepted:
+                return
 
-        # Load (may take a moment for large databases)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        # Geometry is shared by every simulation in the file (edges has no
+        # simulation_id), so it is read once here and reused across switches.
         try:
             edges = load_edges(conn)
-            if not edges:
-                QApplication.restoreOverrideCursor()
-                QMessageBox.critical(self, "Error", "No edges found in database.")
-                return
-
-            bundle = load_road_data(conn, edges, sim_id)
-            global_data = load_global_data(conn, sim_id)
-        except Exception as exc:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Error", f"Failed to load data:\n{exc}")
+        except Exception as exc:  # noqa: BLE001 - malformed geometry/SQL, show it
+            QMessageBox.critical(self, "Error", f"Failed to load edges:\n{exc}")
             return
         finally:
             conn.close()
 
+        if not edges:
+            QMessageBox.critical(self, "Error", "No edges found in database.")
+            return
+
+        self._edges = edges
+        self._simulations = sims
+        self._file_vehicle_length = None  # re-measured for a newly opened file
+        self._populate_sim_combo(sim_id)
+        self._start_simulation_load(sim_id, reuse_geometry=False)
+
+    # ── Simulation switching ──────────────────────────────────────────────────
+
+    def _populate_sim_combo(self, current_id: int | None):
+        """Fill the toolbar selector without its own signal firing a switch."""
+        self._sim_combo.blockSignals(True)
+        self._sim_combo.clear()
+        for sim in self._simulations:
+            self._sim_combo.addItem(sim["name"], userData=sim["id"])
+        if current_id is not None:
+            idx = self._sim_combo.findData(current_id)
+            if idx >= 0:
+                self._sim_combo.setCurrentIndex(idx)
+        self._sim_combo.blockSignals(False)
+
+    @Slot(int)
+    def _on_sim_combo_changed(self, _index: int):
+        sim_id = self._sim_combo.currentData()
+        if sim_id is None or sim_id == self._sim_id or self._sim_loader is not None:
+            return
+        self._start_simulation_load(sim_id, reuse_geometry=True)
+
+    def _start_simulation_load(self, sim_id: int, *, reuse_geometry: bool):
+        """
+        Read one simulation on a worker thread, behind a cancellable dialog.
+
+        The read is seconds long. On the GUI thread it would freeze the window -
+        and, because Qt would never get an event-loop turn, whatever widget
+        triggered the load would stay painted on screen until it finished.
+        """
+        if self._db_path is None or self._sim_loader is not None:
+            return
+
+        self._sim_load_progress = QProgressDialog(
+            "Reading simulation data…", "Cancel", 0, 0, self
+        )
+        self._sim_load_progress.setWindowTitle("Loading")
+        self._sim_load_progress.setWindowModality(Qt.WindowModal)
+        self._sim_load_progress.setMinimumDuration(0)
+        self._sim_load_progress.setAutoClose(False)
+        self._sim_load_progress.setAutoReset(False)
+        self._sim_load_progress.setValue(0)
+
+        loader = SimulationLoader(
+            self._db_path, sim_id, self._edges, self._file_vehicle_length
+        )
+        thread = QThread(self)
+        loader.moveToThread(thread)
+        thread.started.connect(loader.run)
+        # Both slots must be bound methods of *this* object, not lambdas: a
+        # lambda has no thread affinity, so Qt would run it on the worker
+        # thread, where quitting and waiting for that same thread deadlocks.
+        loader.progress.connect(self._on_sim_load_progress)
+        loader.done.connect(self._on_sim_loaded)
+        # Cancel is called directly rather than connected to loader.cancel: the
+        # loader lives on the worker thread, which is deep in the read loop and
+        # would not reach its event loop to receive a queued call. Setting the
+        # loader's threading.Event from here is the thread-safe way in.
+        self._sim_load_progress.canceled.connect(self._cancel_sim_load)
+
+        self._sim_reuse_geometry = reuse_geometry
+        self._sim_loader = loader
+        self._sim_thread = thread
+        thread.start()
+
+    @Slot()
+    def _cancel_sim_load(self):
+        if self._sim_loader is not None:
+            self._sim_loader.cancel()
+
+    @Slot(int)
+    def _on_sim_load_progress(self, rows: int):
+        if self._sim_load_progress is not None:
+            self._sim_load_progress.setLabelText(f"Read {rows / 1e6:.1f}M rows…")
+
+    @Slot(object, str)
+    def _on_sim_loaded(self, result, error: str):
+        reuse_geometry = self._sim_reuse_geometry
+        if self._sim_load_progress is not None:
+            self._sim_load_progress.reset()
+            self._sim_load_progress.deleteLater()
+            self._sim_load_progress = None
+
+        thread, self._sim_thread = self._sim_thread, None
+        loader, self._sim_loader = self._sim_loader, None
+        if thread is not None:
+            thread.quit()
+            thread.wait(5000)
+            thread.deleteLater()
+        if loader is not None:
+            loader.deleteLater()
+
+        if result is None:
+            # Cancelled (error "") or failed: the current simulation is still
+            # loaded and untouched, so only the selector has to be put back.
+            self._populate_sim_combo(self._sim_id)
+            if error:
+                QMessageBox.critical(self, "Error", f"Failed to load data:\n{error}")
+            else:
+                self.statusBar().showMessage("Loading cancelled", 4000)
+            return
+
+        bundle = result["bundle"]
         if not bundle["datetimes"]:
-            QApplication.restoreOverrideCursor()
+            self._populate_sim_combo(self._sim_id)
             QMessageBox.critical(
-                self, "Error", f"No road_data found for simulation ID {sim_id}."
+                self,
+                "Error",
+                f"No road_data found for simulation ID {result['sim_id']}.",
             )
             return
 
-        self._initialize_app(edges, bundle, global_data)
-        QApplication.restoreOverrideCursor()
+        self._apply_simulation(
+            result["sim_id"],
+            bundle,
+            result["global_data"],
+            reuse_geometry=reuse_geometry,
+        )
 
-    def _initialize_app(self, edges: list[dict], bundle: dict, global_data: list[dict]):
-        self._edges = edges
+    def _apply_simulation(
+        self,
+        sim_id: int,
+        bundle: dict,
+        global_data: list[dict],
+        *,
+        reuse_geometry: bool,
+    ):
+        """
+        Install a freshly loaded simulation.
+
+        With reuse_geometry the map is not touched at all - no set_edges, no
+        fit_bounds - so zoom and centre stay exactly where the user left them,
+        and the time position, recording marks, selected edge and colour
+        settings are carried across too.
+        """
+        # What to carry over, captured before anything is replaced
+        old_datetimes = self._datetimes
+        old_idx = self._current_idx
+        old_in, old_out = self._in_idx, self._out_idx
+        old_edge = self._highlighted_edge
+        old_col = self._chart.current_column()
+
+        self._sim_id = sim_id
         self._datetimes = bundle["datetimes"]
         self._values = bundle["values"]
         self._obs_domains = bundle["domains"]
@@ -764,46 +956,53 @@ class MainWindow(QMainWindow):
         self._vehicle_length_source = bundle.get("vehicle_length_source", "")
         self._obs_domains["density_norm"] = (0.0, self._norm_max_spin.value())
         self._global_data = global_data
-        self._current_idx = 0
-        self._highlighted_edge = None
+        # Measured over every simulation in the file, so it holds for the next
+        # switch too and that second full scan can be skipped.
+        if self._file_vehicle_length is None and math.isfinite(self._vehicle_length):
+            self._file_vehicle_length = self._vehicle_length
 
-        # Push edges to map
-        self._map.set_edges(edges)
-        self._map.highlighted_edge_id = None
-        self._map.highlighted_node = None
-
-        # Centre map on median geometry coordinate
-        all_lats = [lat for e in edges for lon, lat in e["geometry"]]
-        all_lons = [lon for e in edges for lon, lat in e["geometry"]]
-        if all_lats:
-            self._map.fit_bounds(
-                min(all_lats),
-                min(all_lons),
-                max(all_lats),
-                max(all_lons),
-            )
-
-        # Slider
         n = len(self._datetimes)
-        self._slider.setMaximum(n - 1)
-        self._slider.setValue(0)
 
-        # Recording window — a range from the previous database means nothing here
-        self._in_idx = None
-        self._out_idx = None
+        if not reuse_geometry:
+            self._current_idx = 0
+            self._highlighted_edge = None
+            self._map.set_edges(self._edges)
+            self._map.highlighted_edge_id = None
+            self._map.highlighted_node = None
+            # Centre map on median geometry coordinate
+            all_lats = [lat for e in self._edges for lon, lat in e["geometry"]]
+            all_lons = [lon for e in self._edges for lon, lat in e["geometry"]]
+            if all_lats:
+                self._map.fit_bounds(
+                    min(all_lats), min(all_lons), max(all_lats), max(all_lons)
+                )
+            self._in_idx = None
+            self._out_idx = None
+            new_idx = 0
+        else:
+            # Same moment of the day rather than the same row: the runs may be
+            # different days, and may not even share a timestep grid.
+            new_idx = _nearest_time_index(old_datetimes, old_idx, self._datetimes)
+            self._in_idx = None if old_in is None else min(old_in, n - 1)
+            self._out_idx = None if old_out is None else min(old_out, n - 1)
+            self._highlighted_edge = old_edge
+
+        self._slider.blockSignals(True)
+        self._slider.setMaximum(n - 1)
+        self._slider.setValue(new_idx)
+        self._slider.blockSignals(False)
         self._update_range_ui()
 
-        # Chart
-        self._chart.set_global_data(global_data)
-
-        # Legend
+        self._chart.set_global_data(global_data, keep_column=old_col)
         self._refresh_legend()
 
-        # First frame
-        self._apply_timestep(0)
+        self._apply_timestep(new_idx)
         self._set_data_loaded(True)
+        name = next(
+            (s["name"] for s in self._simulations if s["id"] == sim_id), str(sim_id)
+        )
         self.statusBar().showMessage(
-            f"Loaded {len(edges)} edges · {n} timesteps · vehicle length "
+            f"{name} · {len(self._edges)} edges · {n} timesteps · vehicle length "
             f"{self._vehicle_length:.2f} m ({self._vehicle_length_source})",
             15000,
         )
@@ -1277,6 +1476,9 @@ class MainWindow(QMainWindow):
 
     def _set_data_loaded(self, loaded: bool):
         """Enable/disable controls that require data to be present."""
+        # Only switchable with a file open, more than one run in it, and no
+        # load already running.
+        self._sim_combo.setEnabled(loaded and len(self._simulations) > 1)
         self._play_btn.setEnabled(loaded)
         self._slider.setEnabled(loaded)
         self._obs_combo.setEnabled(loaded)
@@ -1300,6 +1502,13 @@ class MainWindow(QMainWindow):
         if self._recorder is not None and self._recorder.is_active():
             self._recorder.cancel()
             self._recorder.finish_now()
+        # A simulation read in flight has to be stopped too, or the worker
+        # thread outlives the window it would emit into.
+        if self._sim_loader is not None:
+            self._sim_loader.cancel()
+        if self._sim_thread is not None:
+            self._sim_thread.quit()
+            self._sim_thread.wait(5000)
         # Stop playback and tile loader threads cleanly
         self._timer.stop()
         self._map._pool.waitForDone(2000)
